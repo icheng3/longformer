@@ -3,6 +3,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+import tensorflow as tf
 from longformer.diagonaled_mm_tvm import diagonaled_mm as diagonaled_mm_tvm, mask_invalid_locations
 from longformer.sliding_chunks import sliding_chunks_matmul_qk, sliding_chunks_matmul_pv
 from longformer.sliding_chunks import sliding_chunks_no_overlap_matmul_qk, sliding_chunks_no_overlap_matmul_pv
@@ -63,13 +64,20 @@ class LongformerSelfAttention(nn.Module):
         self.head_dim = int(config.hidden_size / config.num_attention_heads)
         self.embed_dim = config.hidden_size
 
-        self.query = nn.Linear(config.hidden_size, self.embed_dim)
-        self.key = nn.Linear(config.hidden_size, self.embed_dim)
-        self.value = nn.Linear(config.hidden_size, self.embed_dim)
+        #self.query = nn.Linear(config.hidden_size, self.embed_dim)
+        self.query = tf.keras.Layers.Dense(self.embed_dim)
+        #self.key = nn.Linear(config.hidden_size, self.embed_dim)
+        self.key = tf.keras.Layers.Dense(self.embed_dim)
+        #self.value = nn.Linear(config.hidden_size, self.embed_dim)
+        self.value = tf.keras.Layers.Dense(self.embed_dim)
 
-        self.query_global = nn.Linear(config.hidden_size, self.embed_dim)
-        self.key_global = nn.Linear(config.hidden_size, self.embed_dim)
-        self.value_global = nn.Linear(config.hidden_size, self.embed_dim)
+        # self.query_global = nn.Linear(config.hidden_size, self.embed_dim)
+        # self.key_global = nn.Linear(config.hidden_size, self.embed_dim)
+        # self.value_global = nn.Linear(config.hidden_size, self.embed_dim)
+
+        self.query_global = tf.keras.Layers.Dense(self.embed_dim)
+        self.key_global = tf.keras.Layers.Dense(self.embed_dim)
+        self.value_global = tf.keras.Layers.Dense(self.embed_dim)
 
         self.dropout = config.attention_probs_dropout_prob
 
@@ -119,8 +127,9 @@ class LongformerSelfAttention(nn.Module):
                 # in a 3d tensor and pad it to `max_num_extra_indices_per_batch`
                 # 1) selecting embeddings that correspond to global attention
                 extra_attention_mask_nonzeros = extra_attention_mask.nonzero(as_tuple=True)
-                zero_to_max_range = torch.arange(0, max_num_extra_indices_per_batch,
-                                                 device=num_extra_indices_per_batch.device)
+                # zero_to_max_range = torch.arange(0, max_num_extra_indices_per_batch,
+                #                                  device=num_extra_indices_per_batch.device)
+                zero_to_max_range = tf.range(0, max_num_extra_indices_per_batch ,dtype=tf.int32, name='zero_to_max_range')
                 # mask indicating which values are actually going to be padding
                 selection_padding_mask = zero_to_max_range < num_extra_indices_per_batch.unsqueeze(dim=-1)
                 # 2) location of the non-padding values in the selected global attention
@@ -180,12 +189,15 @@ class LongformerSelfAttention(nn.Module):
             selected_k = k.new_zeros(bsz, max_num_extra_indices_per_batch, self.num_heads, self.head_dim)
             selected_k[selection_padding_mask_nonzeros] = k[extra_attention_mask_nonzeros]
             # (bsz, seq_len, num_heads, max_num_extra_indices_per_batch)
-            selected_attn_weights = torch.einsum('blhd,bshd->blhs', (q, selected_k))
+            # selected_attn_weights = torch.einsum('blhd,bshd->blhs', (q, selected_k))
+            selected_attn_weights = tf.einsum('blhd,bshd->blhs', (q, selected_k))
             selected_attn_weights[selection_padding_mask_zeros[0], :, :, selection_padding_mask_zeros[1]] = -10000
             # concat to attn_weights
             # (bsz, seq_len, num_heads, extra attention count + 2*window+1)
-            attn_weights = torch.cat((selected_attn_weights, attn_weights), dim=-1)
-        attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
+            # attn_weights = torch.cat((selected_attn_weights, attn_weights), dim=-1)
+            attn_weights = tf.concat((selected_attn_weights, attn_weights), axis=-1)
+        # attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
+        attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=tf.float32)  # use fp32 for numerical stability
         if key_padding_mask is not None:
             # softmax sometimes inserts NaN if all positions are masked, replace them with 0
             attn_weights_float = torch.masked_fill(attn_weights_float, key_padding_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
@@ -199,7 +211,8 @@ class LongformerSelfAttention(nn.Module):
             selected_v[selection_padding_mask_nonzeros] = v[extra_attention_mask_nonzeros]
             # use `matmul` because `einsum` crashes sometimes with fp16
             # attn = torch.einsum('blhs,bshd->blhd', (selected_attn_probs, selected_v))
-            attn = torch.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
+            #attn = torch.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
+            attn = tf.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
             attn_probs = attn_probs.narrow(-1, max_num_extra_indices_per_batch, attn_probs.size(-1) - max_num_extra_indices_per_batch).contiguous()
 
         if self.attention_mode == 'tvm':
@@ -231,6 +244,7 @@ class LongformerSelfAttention(nn.Module):
             k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # bsz * self.num_heads, seq_len, head_dim)
             v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # bsz * self.num_heads, seq_len, head_dim)
             attn_weights = torch.bmm(q, k.transpose(1, 2))
+            
             assert list(attn_weights.size()) == [bsz * self.num_heads, max_num_extra_indices_per_batch, seq_len]
 
             attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, seq_len)

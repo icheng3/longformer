@@ -4,7 +4,7 @@ from functools import lru_cache
 import torch
 import os.path
 
-#comment adding
+
 class DiagonaledMM(torch.autograd.Function):
     '''Class to encapsulate tvm code for compiling a diagonal_mm function, in addition to calling
     this function from PyTorch
