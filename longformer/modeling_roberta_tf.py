@@ -18,10 +18,10 @@
 
 import math
 from typing import List, Optional, Tuple, Union
-from longformer.longformer import LongformerSelfAttention
+# from longformer import LongformerSelfAttention
 import tensorflow as tf
+import numpy as np
 
-import torch.utils.checkpoint
 from transformers.activations_tf import get_tf_activation
 
 from transformers.modeling_tf_utils import (
@@ -29,15 +29,19 @@ from transformers.modeling_tf_utils import (
     TFModelInputType,
     TFMultipleChoiceLoss,
     TFPreTrainedModel,
-    TFQuestionAnsweringLoss,
-    TFSequenceClassificationLoss,
     TFTokenClassificationLoss,
-    TFBaseModelOutputWithPastAndCrossAttentions,
-    TFMaskedLMOutput,
+    TFMultipleChoiceLoss,
+    
     get_initializer,
     keras_serializable,
     unpack_inputs,
-    hf_compute_loss
+   
+)
+
+from transformers.modeling_tf_outputs import (
+TFMultipleChoiceModelOutput,
+ TFBaseModelOutputWithPastAndCrossAttentions,
+ TFMaskedLMOutput,
 )
 
 from transformers.tf_utils import shape_list, stable_softmax
@@ -50,7 +54,7 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from longformer.roberta_config import RobertaConfig
+from roberta_config import RobertaConfig
 
 
 logger = logging.get_logger(__name__)
@@ -153,10 +157,6 @@ class RobertaEmbeddings(tf.keras.layers.Layer):
 class RobertaSelfOutput(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        # self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        # self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
         self.dense = tf.keras.layers.Dense(
             units=config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
@@ -300,11 +300,11 @@ class RobertaEncoder(tf.keras.layers.Layer):
         encoder_hidden_states,
         encoder_attention_mask,
         past_key_values,
-        use_cache,
         output_attentions,
         output_hidden_states,
         return_dict,
         padding_len=0,
+        use_cache=False,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -334,7 +334,6 @@ class RobertaEncoder(tf.keras.layers.Layer):
                 next_decoder_cache += (layer_outputs[-1],)
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
-                #all_global_attentions = all_global_attentions + (tf.transpose(layer_outputs[2], (0, 1, 3, 2)),)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
         
@@ -495,7 +494,7 @@ ROBERTA_INPUTS_DOCSTRING = r"""
     "The bare RoBERTa Model transformer outputting raw hidden-states without any specific head on top.",
     ROBERTA_START_DOCSTRING,
 )
-class RobertaModel(TFPreTrainedModel):
+class RobertaModel(TFPreTrainedModel): #THIS IS WHAT WE WILL BE CREATING AN INSTANCE OF I BELIEVE YES
     """
     The model can behave as an encoder (with only self-attention) as well as a decoder, in which case a layer of
     cross-attention is added between the self-attention layers, following the architecture described in *Attention is
@@ -584,6 +583,9 @@ class RobertaModel(TFPreTrainedModel):
             If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
             `past_key_values`).
         """
+        ##let's first make sure all the right types...
+        input_ids = tf.cast(input_ids, dtype=tf.dtypes.int64)
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -598,15 +600,14 @@ class RobertaModel(TFPreTrainedModel):
             input_shape = shape_list(inputs_embeds)[:-1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
-
+        if attention_mask is None:
+            attention_mask = tf.cast(tf.fill(input_shape, 1), tf.int64)
+        attention_mask = tf.cast(attention_mask, tf.int64)
         # batch_size, seq_length = input_shape
         # device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         # past_key_values_length
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-
-        if attention_mask is None:
-            attention_mask = tf.cast(tf.fill(input_shape, 1), tf.int64)
 
         if token_type_ids is None:
             tf.cast(tf.fill(input_shape, 0), tf.int64)
@@ -775,7 +776,7 @@ class RobertaLMHead(tf.keras.layers.Layer):
     """Roberta Head for masked language modeling."""
 
     def __init__(self, config, input_embeddings, **kwargs):
-        super().__init__()
+        super().__init__(**kwargs)
         self.dense = tf.keras.layers.Dense(
             config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
@@ -797,3 +798,346 @@ class RobertaLMHead(tf.keras.layers.Layer):
 
         return hidden
 
+@add_start_docstrings(
+    """
+    Roberta Model with a multiple choice classification head on top (a linear layer on top of the pooled output and a
+    softmax) e.g. for RocStories/SWAG tasks.
+    """,
+    ROBERTA_START_DOCSTRING,
+)
+class RobertaForMultipleChoice(RobertaPreTrainedModel, TFMultipleChoiceLoss):
+    # names with a '.' represents the authorized unexpected/missing layers when a TF model is loaded from a PT model
+    _keys_to_ignore_on_load_unexpected = [r"lm_head"]
+    _keys_to_ignore_on_load_missing = [r"dropout"]
+
+    def __init__(self, config, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        self.roberta = RobertaModel(config, name="roberta")
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+        self.classifier = tf.keras.layers.Dense(
+            1, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
+        )
+
+    @property
+    def dummy_inputs(self):
+        """
+        Dummy inputs to build the network.
+        Returns:
+            tf.Tensor with dummy inputs
+        """
+        return {"input_ids": tf.constant(MULTIPLE_CHOICE_DUMMY_INPUTS, dtype=tf.int32)}
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(ROBERTA_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
+    @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=TFMultipleChoiceModelOutput,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def call(
+        self,
+        input_ids: Optional[TFModelInputType] = None,
+        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFMultipleChoiceModelOutput, Tuple[tf.Tensor]]:
+        r"""
+        labels (`tf.Tensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the multiple choice classification loss. Indices should be in `[0, ..., num_choices]`
+            where `num_choices` is the size of the second dimension of the input tensors. (See `input_ids` above)
+        """
+
+        if input_ids is not None:
+            num_choices = shape_list(input_ids)[1]
+            seq_length = shape_list(input_ids)[2]
+        else:
+            num_choices = shape_list(inputs_embeds)[1]
+            seq_length = shape_list(inputs_embeds)[2]
+
+        flat_input_ids = tf.reshape(input_ids, (-1, seq_length)) if input_ids is not None else None
+        flat_attention_mask = tf.reshape(attention_mask, (-1, seq_length)) if attention_mask is not None else None
+        flat_token_type_ids = tf.reshape(token_type_ids, (-1, seq_length)) if token_type_ids is not None else None
+        flat_position_ids = tf.reshape(position_ids, (-1, seq_length)) if position_ids is not None else None
+        outputs = self.roberta(
+            flat_input_ids,
+            flat_attention_mask,
+            flat_token_type_ids,
+            flat_position_ids,
+            head_mask,
+            inputs_embeds,
+            output_attentions,
+            output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(pooled_output, training=training)
+        logits = self.classifier(pooled_output)
+        reshaped_logits = tf.reshape(logits, (-1, num_choices))
+
+        loss = None if labels is None else self.hf_compute_loss(labels, reshaped_logits)
+
+        if not return_dict:
+            output = (reshaped_logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TFMultipleChoiceModelOutput(
+            loss=loss,
+            logits=reshaped_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    @tf.function(
+        input_signature=[
+            {
+                "input_ids": tf.TensorSpec((None, None, None), tf.int32, name="input_ids"),
+                "attention_mask": tf.TensorSpec((None, None, None), tf.int32, name="attention_mask"),
+            }
+        ]
+    )
+    def serving(self, inputs):
+        output = self.call(inputs)
+
+        return self.serving_output(output)
+
+    # Copied from transformers.models.bert.modeling_tf_bert.TFBertForMultipleChoice.serving_output
+    def serving_output(self, output: TFMultipleChoiceModelOutput) -> TFMultipleChoiceModelOutput:
+        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
+        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
+
+        return TFMultipleChoiceModelOutput(logits=output.logits, hidden_states=hs, attentions=attns)
+
+class LongformerSelfAttention(tf.keras.layers.Layer): #used to be nn.module
+    def __init__(self, config, layer_id, **kwargs):
+        super(LongformerSelfAttention, self).__init__(**kwargs)
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                "The hidden size (%d) is not a multiple of the number of attention "
+                "heads (%d)" % (config.hidden_size, config.num_attention_heads))
+        self.num_heads = config.num_attention_heads
+        self.head_dim = int(config.hidden_size / config.num_attention_heads)
+        self.embed_dim = config.hidden_size
+        self.query = tf.keras.layers.Layer.Dense(self.embed_dim, activation='relu')
+        self.key = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
+        self.value = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
+        self.query_global = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
+        self.key_global = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
+        self.value_global = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
+        self.dropout = config.attention_probs_dropout_prob #this is a rate
+        self.layer_id = layer_id
+        self.attention_window = config.attention_window[self.layer_id] #this is a value
+        self.attention_dilation = config.attention_dilation[self.layer_id] #this is a value
+        self.attention_mode = config.attention_mode #this is a string
+        self.autoregressive = config.autoregressive #this is a boolean
+        #self.one_sided_attn_window = config.attention_window[self.layer_id] // 2
+        assert self.attention_window > 0
+        assert self.attention_dilation > 0
+        assert self.attention_mode in ['tvm', 'sliding_chunks', 'sliding_chunks_no_overlap']
+        if self.attention_mode in ['sliding_chunks', 'sliding_chunks_no_overlap']:
+            assert not self.autoregressive  # not supported
+            assert self.attention_dilation == 1  # dilation is not supported
+
+    def call(self, inputs, training=False,):
+        (
+            hidden_states,
+            attention_mask,
+            head_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            output_attentions,
+        ) = inputs
+        '''
+        The `attention_mask` is changed in `BertModel.forward` from 0, 1, 2 to
+            -ve: no attention
+              0: local attention
+            +ve: global attention
+        '''
+        assert encoder_hidden_states is None, "`encoder_hidden_states` is not supported and should be None"
+        assert encoder_attention_mask is None, "`encoder_attention_mask` is not supported and shiould be None"
+        assert head_mask is None, "`head_mask` is not supported and should be None"
+
+        if attention_mask is not None:
+            #attention_mask = attention_mask.squeeze(dim=2).squeeze(dim=1)
+            attention_mask = tf.squeeze(tf.squeeze(attention_mask, axis=2), axis=1)
+            key_padding_mask = attention_mask < 0
+            extra_attention_mask = attention_mask > 0
+            remove_from_windowed_attention_mask = attention_mask != 0
+
+            #num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
+            num_extra_indices_per_batch = tf.math.reduce_sum(tf.convert_to_tensor(extra_attention_mask, dtype=tf.int64)
+    , axis=1, name='num_extra_indices_per_batch')
+            #max_num_extra_indices_per_batch = num_extra_indices_per_batch.max() #what is this doing???
+            extra_attention_mask = None
+            # if max_num_extra_indices_per_batch <= 0:
+            #     extra_attention_mask = None #this is the global attention
+            # else:
+            #     # To support the case of variable number of global attention in the rows of a batch,
+            #     # we use the following three selection masks to select global attention embeddings
+            #     # in a 3d tensor and pad it to `max_num_extra_indices_per_batch`
+            #     # 1) selecting embeddings that correspond to global attention
+            #     #extra_attention_mask_nonzeros = extra_attention_mask.nonzero(as_tuple=True)
+            #     extra_attention_mask_nonzeros=tf.experimental.numpy.nonzero(extra_attention_mask)
+            #     # zero_to_max_range = torch.arange(0, max_num_extra_indices_per_batch,
+            #     #                                  device=num_extra_indices_per_batch.device)
+            #     zero_to_max_range = tf.range(0, max_num_extra_indices_per_batch ,dtype=tf.int32, name='zero_to_max_range')
+            #     # mask indicating which values are actually going to be padding
+            #     # num_extra_indices_per_batch.unsqueeze(dim=-1)
+            #     selection_padding_mask = zero_to_max_range < tf.expand_dims(num_extra_indices_per_batch, axis = -1)
+            #     # 2) location of the non-padding values in the selected global attention
+            #     #selection_padding_mask_nonzeros = selection_padding_mask.nonzero(as_tuple=True)
+            #     selection_padding_mask_nonzeros = tf.experimental.numpy.nonzero(selection_padding_mask)
+            #     # 3) location of the padding values in the selected global attention
+            #     # selection_padding_mask_zeros = (selection_padding_mask == 0).nonzero(as_tuple=True)
+            #     selection_padding_mask_zeros = tf.experimental.numpy.nonzero((selection_padding_mask == 0))
+
+        else:
+            remove_from_windowed_attention_mask = None
+            extra_attention_mask = None
+            key_padding_mask = None
+
+        #hidden_states = hidden_states.transpose(0, 1)
+        hidden_states = tf.transpose(hidden_states)
+        seq_len, bsz, embed_dim = tf.TensorShape(hidden_states).as_list()
+        assert embed_dim == self.embed_dim
+        q = self.query(hidden_states)
+        k = self.key(hidden_states)
+        v = self.value(hidden_states)
+        q /= math.sqrt(tf.cast(self.head_dim, dtype=q.dtype))
+
+        q = tf.reshape(q, (bsz, seq_len, self.num_heads, self.head_dim))
+        k = tf.reshape(k, (bsz, seq_len, self.num_heads, self.head_dim))
+        # attn_weights = (bsz, seq_len, num_heads, window*2+1)
+        attn_weights = sliding_chunks_matmul_qk(q, k, self.attention_window, padding_value=0)
+        #mask_invalid_locations(attn_weights, self.attention_window, self.attention_dilation, False)
+        if remove_from_windowed_attention_mask is not None:
+            # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
+            # from (bsz x seq_len) to (bsz x seq_len x num_heads x hidden_size)
+            # remove_from_windowed_attention_mask = remove_from_windowed_attention_mask.unsqueeze(dim=-1).unsqueeze(dim=-1)
+            remove_from_windowed_attention_mask = tf.expand_dims(tf.expand_dims(remove_from_windowed_attention_mask, axis=-1), axis=-1)
+            #remove_from_windowed_attention_mask = tf.cast(remove_from_windowed_attention_mask, dtype=q.dtype) * LARGE_NEGATIVE
+            # cast to float/half then replace 1's with -inf
+            #float_mask = remove_from_windowed_attention_mask.type_as(q).masked_fill(remove_from_windowed_attention_mask, -10000.0)
+            float_mask = tf.where(remove_from_windowed_attention_mask,-10000.0, tf.cast(remove_from_windowed_attention_mask, dtype=q.dtype))
+            repeat_size = 1 if isinstance(self.attention_dilation, int) else len(self.attention_dilation)
+            # float_mask = float_mask.repeat(1, 1, repeat_size, 1)
+            float_mask = tf.repeat(float_mask, 1, repeat_size, 1)
+            ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
+            # diagonal mask with zeros everywhere and -inf inplace of padding
+            d_mask = sliding_chunks_matmul_qk(ones, float_mask, self.attention_window, padding_value=0)
+
+            attn_weights += d_mask
+            attn_probs = tf.keras.activations.softmax(attn_weights, axis=-1)
+        assert list(attn_weights.size())[:3] == [bsz, seq_len, self.num_heads]
+        assert attn_weights.size(dim=3) in [self.attention_window * 2 + 1, self.attention_window * 3]
+        attn_probs = self.dropout(attn_probs, training=training)
+
+
+        # # the extra attention --> FOR GLOBALL ATTENTION, NOT IMPLEMENTING
+        # if extra_attention_mask is not None:
+        #     selected_k = k.new_zeros(bsz, max_num_extra_indices_per_batch, self.num_heads, self.head_dim)
+        #     selected_k[selection_padding_mask_nonzeros] = k[extra_attention_mask_nonzeros]
+        #     # (bsz, seq_len, num_heads, max_num_extra_indices_per_batch)
+        #     # selected_attn_weights = torch.einsum('blhd,bshd->blhs', (q, selected_k))
+        #     selected_attn_weights = tf.einsum('blhd,bshd->blhs', (q, selected_k))
+        #     selected_attn_weights[selection_padding_mask_zeros[0], :, :, selection_padding_mask_zeros[1]] = -10000
+        #     # concat to attn_weights
+        #     # (bsz, seq_len, num_heads, extra attention count + 2*window+1)
+        #     # attn_weights = torch.cat((selected_attn_weights, attn_weights), dim=-1)
+        #     attn_weights = tf.concat((selected_attn_weights, attn_weights), axis=-1)
+        # # attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
+        # attn_weights_float = tf.nn.softmax(attn_weights, dim=-1, name='attn_weights_float')  # use fp32 for numerical stability
+        # if key_padding_mask is not None:
+        #     # softmax sometimes inserts NaN if all positions are masked, replace them with 0
+        #     #attn_weights_float = torch.masked_fill(attn_weights_float, key_padding_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+        #     attn_weights_float = tf.where(attn_weights_float, key_padding_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+        # attn_weights = attn_weights_float.type_as(attn_weights)
+        # attn_probs = F.dropout(attn_weights_float.type_as(attn_weights), p=self.dropout, training=self.training)
+        # v = v.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        # attn = 0
+        # if extra_attention_mask is not None:
+        #     selected_attn_probs = attn_probs.narrow(-1, 0, max_num_extra_indices_per_batch)
+        #     selected_v = v.new_zeros(bsz, max_num_extra_indices_per_batch, self.num_heads, self.head_dim)
+        #     selected_v[selection_padding_mask_nonzeros] = v[extra_attention_mask_nonzeros]
+        #     # use `matmul` because `einsum` crashes sometimes with fp16
+        #     # attn = torch.einsum('blhs,bshd->blhd', (selected_attn_probs, selected_v))
+        #     #attn = torch.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
+        #     attn = tf.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
+        #     attn_probs = attn_probs.narrow(-1, max_num_extra_indices_per_batch, attn_probs.size(-1) - max_num_extra_indices_per_batch).contiguous()
+
+        # if self.attention_mode == 'tvm':
+        #     v = v.float().contiguous()
+        #     attn = diagonaled_mm_tvm(attn_probs, v, self.attention_window, self.attention_dilation, True, 0, False)
+        if self.attention_mode == "sliding_chunks":#this is the only case we will ever enter i think
+            attn = sliding_chunks_matmul_pv(attn_probs, v, self.attention_window)
+        # elif self.attention_mode == "sliding_chunks_no_overlap": 
+        #     attn = sliding_chunks_no_overlap_matmul_pv(attn_probs, v, self.attention_window)
+        else:
+            raise False
+
+        attn = attn.type_as(hidden_states)
+        assert list(tf.TensorShape(attn)) == [bsz, seq_len, self.num_heads, self.head_dim]
+        attn = tf.reshape(attn, (bsz, seq_len, embed_dim))
+        
+
+        # # For this case, we'll just recompute the attention for these indices
+        # # and overwrite the attn tensor. TODO: remove the redundant computation
+        # if extra_attention_mask is not None:
+        #     selected_hidden_states = hidden_states.new_zeros(max_num_extra_indices_per_batch, bsz, embed_dim)
+        #     selected_hidden_states[selection_padding_mask_nonzeros[::-1]] = hidden_states[extra_attention_mask_nonzeros[::-1]]
+
+        #     q = self.query_global(selected_hidden_states)
+        #     k = self.key_global(hidden_states)
+        #     v = self.value_global(hidden_states)
+        #     q /= math.sqrt(self.head_dim)
+
+        #     q = q.contiguous().view(max_num_extra_indices_per_batch, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (bsz*self.num_heads, max_num_extra_indices_per_batch, head_dim)
+        #     k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # bsz * self.num_heads, seq_len, head_dim)
+        #     v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # bsz * self.num_heads, seq_len, head_dim)
+        #     attn_weights = torch.bmm(q, k.transpose(1, 2))
+            
+        #     assert list(attn_weights.size()) == [bsz * self.num_heads, max_num_extra_indices_per_batch, seq_len]
+
+        #     attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, seq_len)
+        #     attn_weights[selection_padding_mask_zeros[0], :, selection_padding_mask_zeros[1], :] = -10000.0
+        #     if key_padding_mask is not None:
+        #         attn_weights = attn_weights.masked_fill(
+        #             key_padding_mask.unsqueeze(1).unsqueeze(2),
+        #             -10000.0,
+        #         )
+        #     attn_weights = attn_weights.view(bsz * self.num_heads, max_num_extra_indices_per_batch, seq_len)
+        #     attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
+        #     attn_probs = F.dropout(attn_weights_float.type_as(attn_weights), p=self.dropout, training=self.training)
+        #     selected_attn = torch.bmm(attn_probs, v)
+        #     assert list(selected_attn.size()) == [bsz * self.num_heads, max_num_extra_indices_per_batch, self.head_dim]
+
+        #     selected_attn_4d = selected_attn.view(bsz, self.num_heads, max_num_extra_indices_per_batch, self.head_dim)
+        #     nonzero_selected_attn = selected_attn_4d[selection_padding_mask_nonzeros[0], :, selection_padding_mask_nonzeros[1]]
+        #     attn[extra_attention_mask_nonzeros[::-1]] = nonzero_selected_attn.view(len(selection_padding_mask_nonzeros[0]), -1).type_as(hidden_states)
+
+        #context_layer = attn.transpose(0, 1)
+        # if output_attentions:
+        #     if extra_attention_mask is not None:
+        #         # With global attention, return global attention probabilities only
+        #         # batch_size x num_heads x max_num_global_attention_tokens x sequence_length
+        #         # which is the attention weights from tokens with global attention to all tokens
+        #         # It doesn't not return local attention
+        #         # In case of variable number of global attantion in the rows of a batch,
+        #         # attn_weights are padded with -10000.0 attention scores
+        #         attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, seq_len)
+        #     else:
+        #         # without global attention, return local attention probabilities
+        #         # batch_size x num_heads x sequence_length x window_size
+        #         # which is the attention weights of every token attending to its neighbours
+        #         attn_weights = attn_weights.permute(0, 2, 1, 3)
+        outputs = (attn, attn_probs) 
+        return outputs
