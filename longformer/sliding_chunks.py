@@ -70,7 +70,7 @@ def sliding_chunks_matmul_qk(q, k, w, padding_value):
 
     # convert diagonals into columns
     diagonal_chunk_attn = _skew(chunk_attn, padding_value=padding_value)
-
+    diagonal_chunk_attn = torch.from_numpy(diagonal_chunk_attn.numpy())
     diagonal_attn = diagonal_chunk_attn.new_empty((bsz * num_heads, chunks_count + 1, w, w * 2 + 1))
 
     # copy parts from diagonal_chunk_attn into the compined matrix of attentions
@@ -83,9 +83,11 @@ def sliding_chunks_matmul_qk(q, k, w, padding_value):
 
     # separate bsz and num_heads dimensions again
     diagonal_attn = diagonal_attn.view(bsz, num_heads, seqlen, 2 * w + 1).transpose(2, 1)
-    diagonal_attn = torch.from_numpy(diagonal_attn.numpy())
+    #diagonal_attn = torch.from_numpy(diagonal_attn.numpy())
     w = torch.from_numpy(w.numpy())
+    diagonal_attn = torch.from_numpy(diagonal_attn.numpy())
     mask_invalid_locations(diagonal_attn, w, 1, False)
+    diagonal_attn = tf.convert_to_tensor(diagonal_attn.numpy())
     return diagonal_attn
 
 
