@@ -3,6 +3,7 @@ from functools import lru_cache
 
 import torch
 import os.path
+import tensorflow as tf
 
 
 class DiagonaledMM(torch.autograd.Function):
@@ -291,13 +292,14 @@ def _get_invalid_locations_mask_fixed_dilation(seq_len: int, w: int, d: int):
         diagonal_mask = torch.zeros(seq_len, device='cpu', dtype=torch.uint8)
         diagonal_mask[:-j] = 1
         diagonals_list.append(diagonal_mask)
-    return torch.stack(diagonals_list, dim=-1)
+    output = torch.stack(diagonals_list, dim=-1)
+    return output
 
 @lru_cache()
 def _get_invalid_locations_mask(w: int, d: Union[torch.Tensor,int], autoregressive: bool, device: str):
-    if isinstance(d, int):
+    if isinstance(d, int): #only instance
         affected_seq_len = w * d
-        mask = _get_invalid_locations_mask_fixed_dilation(affected_seq_len, w, d)
+        mask = _get_invalid_locations_mask_fixed_dilation(affected_seq_len, w, d) #torch
         mask = mask[None, :, None, :]
     else:
         affected_seq_len = w * d.max()
@@ -309,8 +311,8 @@ def _get_invalid_locations_mask(w: int, d: Union[torch.Tensor,int], autoregressi
         mask = torch.stack(head_masks, dim=-2)
         mask = mask[None, :, :, :]
 
-    ending_mask = None if autoregressive else mask.flip(dims=(1, 3)).bool().to(device)
-    return affected_seq_len, mask.bool().to(device), ending_mask
+    ending_mask = None if autoregressive else mask.flip(dims=(1, 3)).bool()#.to(device)
+    return affected_seq_len, mask.bool(), ending_mask
 
 def mask_invalid_locations(input_tensor: torch.Tensor, w: int, d: Union[torch.Tensor, int], autoregressive: bool) -> torch.Tensor:
     affected_seq_len, beginning_mask, ending_mask = _get_invalid_locations_mask(w, d, autoregressive, input_tensor.device)
