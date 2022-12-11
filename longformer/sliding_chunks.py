@@ -33,7 +33,7 @@ def _chunk(x, w):
 
     # non-overlapping chunks of size = 2w
     x = torch.from_numpy(x.numpy())
-    x = torch.from_numpy(w.numpy())
+    w = torch.from_numpy(w.numpy())
     x = x.view(x.size(0), x.size(1) // (w * 2), w * 2, x.size(2))
 
     # use `as_strided` to make the chunks overlap with an overlap size = w
@@ -109,12 +109,14 @@ def sliding_chunks_matmul_pv(probs, v, w):
     padded_v = tf.pad(v, pads, constant_values=-1)
 
     # chunk padded_v into chunks of size 3w and an overlap of size w
-    # chunk_v_size = (bsz * num_heads, chunks_count + 1, 3 * w, head_dim)
-    # chunk_v_stride = padded_v.stride()
-    # chunk_v_stride = chunk_v_stride[0], w * chunk_v_stride[1], chunk_v_stride[1], chunk_v_stride[2]
-    # chunk_v = padded_v.as_strided(size=chunk_v_size, stride=chunk_v_stride)
+    chunk_v_size = (bsz * num_heads, chunks_count + 1, 3 * w, head_dim)
+    padded_v = torch.from_numpy(padded_v.numpy())
+    chunk_v_stride = padded_v.stride()
+    chunk_v_stride = chunk_v_stride[0], w * chunk_v_stride[1], chunk_v_stride[1], chunk_v_stride[2]
+    chunk_v = padded_v.as_strided(size=chunk_v_size, stride=chunk_v_stride)
+    chunk_v = tf.convert_to_tensor(chunk_v.numpy())
 
-    # skewed_prob = _skew2(chunk_prob, padding_value=0)
+    skewed_prob = _skew2(chunk_prob, padding_value=0)
 
     context = tf.einsum('bcwd,bcdh->bcwh', (skewed_prob, chunk_v))
     context = tf.reshape(context, (bsz, num_heads, seqlen, head_dim))
@@ -124,13 +126,6 @@ def sliding_chunks_matmul_pv(probs, v, w):
 def pad_to_window_size(input_ids, attention_mask,
                        one_sided_window_size, pad_token_id):
     '''A helper function to pad tokens and mask to work with the sliding_chunks implementation of Longformer selfattention.
-    Input:
-        input_ids = torch.Tensor(bsz x seqlen): ids of wordpieces
-        attention_mask = torch.Tensor(bsz x seqlen): attention mask
-        one_sided_window_size = int: window size on one side of each token
-        pad_token_id = int: tokenizer.pad_token_id
-    Returns
-        (input_ids, attention_mask) padded to length divisible by 2 * one_sided_window_size
     '''
     w = int(2 * one_sided_window_size)
     seqlen = tf.shape_list(input_ids)[:2]
