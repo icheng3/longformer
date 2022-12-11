@@ -18,24 +18,20 @@
 
 import math
 from typing import List, Optional, Tuple, Union
-# from longformer import LongformerSelfAttention
 import tensorflow as tf
 import numpy as np
 
-from transformers.activations_tf import get_tf_activation
+from sliding_chunks import sliding_chunks_matmul_pv
+
 
 from transformers.modeling_tf_utils import (
     TFMaskedLanguageModelingLoss,
     TFModelInputType,
     TFMultipleChoiceLoss,
     TFPreTrainedModel,
-    TFTokenClassificationLoss,
     TFMultipleChoiceLoss,
-    
     get_initializer,
-    keras_serializable,
     unpack_inputs,
-   
 )
 
 from transformers.modeling_tf_outputs import (
@@ -44,15 +40,14 @@ TFMultipleChoiceModelOutput,
  TFMaskedLMOutput,
 )
 
-from transformers.tf_utils import shape_list, stable_softmax
+from transformers.tf_utils import shape_list
+
 from transformers.utils import (
     MULTIPLE_CHOICE_DUMMY_INPUTS,
-    ModelOutput,
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     logging,
-    replace_return_docstrings,
 )
 from roberta_config import RobertaConfig
 
@@ -78,8 +73,6 @@ class RobertaEmbeddings(tf.keras.layers.Layer):
     """
     Same as BertEmbeddings with a tiny tweak for positional embeddings indexing.
     """
-
-    # Copied from transformers.models.bert.modeling_bert.BertEmbeddings.__init__
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
         self.word_embeddings = self.add_weight(
@@ -97,12 +90,8 @@ class RobertaEmbeddings(tf.keras.layers.Layer):
                 shape=[config.type_vocab_size, config.hidden_size],
                 initializer=get_initializer(config.initializer_range),
             )
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="Layer_norm")
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
-        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        # End copy
+        self.LayerNorm = self.LayerNormalization(epsilon=config.layer_norm_eps, name="Layer_norm")
+        self.dropout = self.Dropout(config.hidden_dropout_prob)
         self.padding_idx = config.pad_token_id
     
     def create_position_ids_from_input_ids(self, input_ids, past_key_values_length=0):
@@ -118,11 +107,17 @@ class RobertaEmbeddings(tf.keras.layers.Layer):
         return position_ids
 
     def call(
-        self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0, training=False
+        self, 
+        input_ids=None, 
+        token_type_ids=None, 
+        position_ids=None, 
+        inputs_embeds=None, 
+        past_key_values_length=0, 
+        training=False
     ):
         if position_ids is None:
             if input_ids is not None:
-                # Create the position ids from the input token ids. Any padded tokens remain padded.
+                # Create the position ids from the input token ids
                 position_ids = self.create_position_ids_from_input_ids(input_ids, past_key_values_length)
             else:
                 position_ids = self.create_position_ids_from_inputs_embeds(inputs_embeds)
@@ -132,11 +127,6 @@ class RobertaEmbeddings(tf.keras.layers.Layer):
         else:
             input_shape = shape_list(inputs_embeds)[:-1]
 
-        seq_length = input_shape[1]
-
-        # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
-        # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
-        # issue #5664
         if token_type_ids is None:
             token_type_ids = tf.zeros(input_shape, dtype=tf.int64)
 
@@ -152,16 +142,14 @@ class RobertaEmbeddings(tf.keras.layers.Layer):
         return embeddings
 
 
-
-# Copied from transformers.models.bert.modeling_bert.BertSelfOutput
 class RobertaSelfOutput(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(
+        self.dense = self.Dense(
             units=config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
-        self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
-        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
+        self.LayerNorm = self.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
+        self.dropout = self.Dropout(rate=config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor, training:bool=False):
         hidden_states = self.dense(hidden_states)
@@ -170,8 +158,7 @@ class RobertaSelfOutput(tf.keras.layers.Layer):
         return hidden_states
 
 
-# Copied from transformers.models.bert.modeling_bert.BertAttention with Bert->Roberta
-class RobertaAttention(tf.keras.layers.Layer):
+class RobertaAttention():
     def __init__(self, config, layer_id=0, **kwargs):
         super().__init__(**kwargs)
         self.self = LongformerSelfAttention(config, layer_id, name='roberta_self_att')
@@ -202,11 +189,10 @@ class RobertaAttention(tf.keras.layers.Layer):
         return outputs
     
 
-# Copied from transformers.models.bert.modeling_bert.BertIntermediate
 class RobertaIntermediate(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(config.intermediate_size, kernel_initializer=get_initializer(config.initializer_range,
+        self.dense = self.Dense(config.intermediate_size, kernel_initializer=get_initializer(config.initializer_range,
         name='dense_layer'))
         self.intermediate_act_fn = config.hidden_act
 
@@ -216,14 +202,13 @@ class RobertaIntermediate(tf.keras.layers.Layer):
         return hidden_states
 
 
-# Copied from transformers.models.bert.modeling_bert.BertOutput
 class RobertaOutput(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(config.hidden_size, kernel_initializer=get_initializer(config.initializer_range,
+        self.dense = self.Dense(config.hidden_size, kernel_initializer=get_initializer(config.initializer_range,
         name='dense_layer'))
-        self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="layernorm")
-        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
+        self.LayerNorm = self.LayerNormalization(epsilon=config.layer_norm_eps, name="layernorm")
+        self.dropout = self.Dropout(rate=config.hidden_dropout_prob)
 
     def call(self, hidden_states, input_tensor, training: bool=False):
         hidden_states = self.dense(hidden_states)
@@ -231,9 +216,7 @@ class RobertaOutput(tf.keras.layers.Layer):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
-
-# Copied from transformers.models.bert.modeling_bert.BertLayer with Bert->Roberta
-class RobertaLayer(tf.keras.layers.Layer):
+class RobertaLayer():
     def __init__(self, config, layer_id=0, **kwargs):
         super().__init__()
         self.seq_len_dim = 1
@@ -281,9 +264,7 @@ class RobertaLayer(tf.keras.layers.Layer):
 
         return outputs
 
-
-# Copied from transformers.models.bert.modeling_bert.BertEncoder with Bert->Roberta
-class RobertaEncoder(tf.keras.layers.Layer):
+class RobertaEncoder():
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
         self.config = config
@@ -372,7 +353,7 @@ class RobertaEncoder(tf.keras.layers.Layer):
 class RobertaPooler(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(
+        self.dense = self.Dense(
             units=config.hidden_size,
             kernel_initializer=get_initializer(config.initializer_range),
             name="pooler_dense",
@@ -494,7 +475,7 @@ ROBERTA_INPUTS_DOCSTRING = r"""
     "The bare RoBERTa Model transformer outputting raw hidden-states without any specific head on top.",
     ROBERTA_START_DOCSTRING,
 )
-class RobertaModel(TFPreTrainedModel): #THIS IS WHAT WE WILL BE CREATING AN INSTANCE OF I BELIEVE YES
+class RobertaModel(TFPreTrainedModel): 
     """
     The model can behave as an encoder (with only self-attention) as well as a decoder, in which case a layer of
     cross-attention is added between the self-attention layers, following the architecture described in *Attention is
@@ -603,35 +584,12 @@ class RobertaModel(TFPreTrainedModel): #THIS IS WHAT WE WILL BE CREATING AN INST
         if attention_mask is None:
             attention_mask = tf.cast(tf.fill(input_shape, 1), tf.int64)
         attention_mask = tf.cast(attention_mask, tf.int64)
-        # batch_size, seq_length = input_shape
-        # device = input_ids.device if input_ids is not None else inputs_embeds.device
 
-        # past_key_values_length
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
         if token_type_ids is None:
             tf.cast(tf.fill(input_shape, 0), tf.int64)
 
-        # # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # # ourselves in which case we just need to make it broadcastable to all heads.
-        # extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
-
-        # # If a 2D or 3D attention mask is provided for the cross-attention
-        # # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        # if self.config.is_decoder and encoder_hidden_states is not None:
-        #     encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-        #     encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-        #     if encoder_attention_mask is None:
-        #         encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-        #     encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        # else:
-        #     encoder_extended_attention_mask = None
-
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
-        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
         attention_mask_shape = shape_list(attention_mask)
         extended_attention_mask = tf.reshape(attention_mask, (attention_mask_shape[0], attention_mask_shape[1], 1, 1))
@@ -674,7 +632,7 @@ class RobertaModel(TFPreTrainedModel): #THIS IS WHAT WE WILL BE CREATING AN INST
 
 
 @add_start_docstrings("""RoBERTa Model with a `language modeling` head on top.""", ROBERTA_START_DOCSTRING)
-class RobertaForMaskedLM(TFPreTrainedModel, TFMaskedLanguageModelingLoss): # TFLongformerPreTrainedModel, TFMaskedLanguageModelingLoss):
+class RobertaForMaskedLM(TFPreTrainedModel, TFMaskedLanguageModelingLoss): 
     _keys_to_ignore_on_save = [r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -777,13 +735,13 @@ class RobertaLMHead(tf.keras.layers.Layer):
 
     def __init__(self, config, input_embeddings, **kwargs):
         super().__init__(**kwargs)
-        self.dense = tf.keras.layers.Dense(
+        self.dense = self.Dense(
             config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
-        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="layer_norm")
+        self.layer_norm = self.LayerNormalization(epsilon=config.layer_norm_eps, name="layer_norm")
 
         self.decoder = input_embeddings
-        self.bias = self.add_weight(shape=(self.vocab_size,), initializer="zeros", trainable=True, name="bias")
+        self.bias = self.add_weight(shape=(config.vocab_size,), initializer="zeros", trainable=True, name="bias")
 
     def call(self, hidden_states):
         hidden = self.dense(hidden_states)
@@ -805,7 +763,7 @@ class RobertaLMHead(tf.keras.layers.Layer):
     """,
     ROBERTA_START_DOCSTRING,
 )
-class RobertaForMultipleChoice(RobertaPreTrainedModel, TFMultipleChoiceLoss):
+class RobertaForMultipleChoice(RobertaPreTrainedModel, TFMultipleChoiceLoss, tf.keras.layers.Layer):
     # names with a '.' represents the authorized unexpected/missing layers when a TF model is loaded from a PT model
     _keys_to_ignore_on_load_unexpected = [r"lm_head"]
     _keys_to_ignore_on_load_missing = [r"dropout"]
@@ -813,9 +771,9 @@ class RobertaForMultipleChoice(RobertaPreTrainedModel, TFMultipleChoiceLoss):
     def __init__(self, config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
-        self.roberta = RobertaModel(config, name="roberta")
+        self.roberta = RobertaModel(config)
         self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
-        self.classifier = tf.keras.layers.Dense(
+        self.classifier = self.Dense(
             1, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
         )
 
@@ -927,19 +885,18 @@ class LongformerSelfAttention(tf.keras.layers.Layer): #used to be nn.module
         self.num_heads = config.num_attention_heads
         self.head_dim = int(config.hidden_size / config.num_attention_heads)
         self.embed_dim = config.hidden_size
-        self.query = tf.keras.layers.Layer.Dense(self.embed_dim, activation='relu')
-        self.key = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
-        self.value = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
-        self.query_global = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
-        self.key_global = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
-        self.value_global = tf.keras.Layers.Dense(self.embed_dim, activation='relu')
-        self.dropout = config.attention_probs_dropout_prob #this is a rate
+        self.query = self.Dense(self.embed_dim, activation='relu')
+        self.key = self.Dense(self.embed_dim, activation='relu')
+        self.value = self.Dense(self.embed_dim, activation='relu')
+        self.query_global = self.Dense(self.embed_dim, activation='relu')
+        self.key_global = self.Dense(self.embed_dim, activation='relu')
+        self.value_global = self.Dense(self.embed_dim, activation='relu')
+        self.dropout = config.attention_probs_dropout_prob 
         self.layer_id = layer_id
-        self.attention_window = config.attention_window[self.layer_id] #this is a value
-        self.attention_dilation = config.attention_dilation[self.layer_id] #this is a value
-        self.attention_mode = config.attention_mode #this is a string
-        self.autoregressive = config.autoregressive #this is a boolean
-        #self.one_sided_attn_window = config.attention_window[self.layer_id] // 2
+        self.attention_window = config.attention_window
+        self.attention_dilation = config.attention_dilation
+        self.attention_mode = config.attention_mode 
+        self.autoregressive = config.autoregressive 
         assert self.attention_window > 0
         assert self.attention_dilation > 0
         assert self.attention_mode in ['tvm', 'sliding_chunks', 'sliding_chunks_no_overlap']
@@ -973,39 +930,15 @@ class LongformerSelfAttention(tf.keras.layers.Layer): #used to be nn.module
             extra_attention_mask = attention_mask > 0
             remove_from_windowed_attention_mask = attention_mask != 0
 
-            #num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
             num_extra_indices_per_batch = tf.math.reduce_sum(tf.convert_to_tensor(extra_attention_mask, dtype=tf.int64)
     , axis=1, name='num_extra_indices_per_batch')
-            #max_num_extra_indices_per_batch = num_extra_indices_per_batch.max() #what is this doing???
             extra_attention_mask = None
-            # if max_num_extra_indices_per_batch <= 0:
-            #     extra_attention_mask = None #this is the global attention
-            # else:
-            #     # To support the case of variable number of global attention in the rows of a batch,
-            #     # we use the following three selection masks to select global attention embeddings
-            #     # in a 3d tensor and pad it to `max_num_extra_indices_per_batch`
-            #     # 1) selecting embeddings that correspond to global attention
-            #     #extra_attention_mask_nonzeros = extra_attention_mask.nonzero(as_tuple=True)
-            #     extra_attention_mask_nonzeros=tf.experimental.numpy.nonzero(extra_attention_mask)
-            #     # zero_to_max_range = torch.arange(0, max_num_extra_indices_per_batch,
-            #     #                                  device=num_extra_indices_per_batch.device)
-            #     zero_to_max_range = tf.range(0, max_num_extra_indices_per_batch ,dtype=tf.int32, name='zero_to_max_range')
-            #     # mask indicating which values are actually going to be padding
-            #     # num_extra_indices_per_batch.unsqueeze(dim=-1)
-            #     selection_padding_mask = zero_to_max_range < tf.expand_dims(num_extra_indices_per_batch, axis = -1)
-            #     # 2) location of the non-padding values in the selected global attention
-            #     #selection_padding_mask_nonzeros = selection_padding_mask.nonzero(as_tuple=True)
-            #     selection_padding_mask_nonzeros = tf.experimental.numpy.nonzero(selection_padding_mask)
-            #     # 3) location of the padding values in the selected global attention
-            #     # selection_padding_mask_zeros = (selection_padding_mask == 0).nonzero(as_tuple=True)
-            #     selection_padding_mask_zeros = tf.experimental.numpy.nonzero((selection_padding_mask == 0))
 
         else:
             remove_from_windowed_attention_mask = None
             extra_attention_mask = None
             key_padding_mask = None
 
-        #hidden_states = hidden_states.transpose(0, 1)
         hidden_states = tf.transpose(hidden_states)
         seq_len, bsz, embed_dim = tf.TensorShape(hidden_states).as_list()
         assert embed_dim == self.embed_dim
@@ -1018,15 +951,11 @@ class LongformerSelfAttention(tf.keras.layers.Layer): #used to be nn.module
         k = tf.reshape(k, (bsz, seq_len, self.num_heads, self.head_dim))
         # attn_weights = (bsz, seq_len, num_heads, window*2+1)
         attn_weights = sliding_chunks_matmul_qk(q, k, self.attention_window, padding_value=0)
-        #mask_invalid_locations(attn_weights, self.attention_window, self.attention_dilation, False)
         if remove_from_windowed_attention_mask is not None:
             # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
             # from (bsz x seq_len) to (bsz x seq_len x num_heads x hidden_size)
-            # remove_from_windowed_attention_mask = remove_from_windowed_attention_mask.unsqueeze(dim=-1).unsqueeze(dim=-1)
             remove_from_windowed_attention_mask = tf.expand_dims(tf.expand_dims(remove_from_windowed_attention_mask, axis=-1), axis=-1)
-            #remove_from_windowed_attention_mask = tf.cast(remove_from_windowed_attention_mask, dtype=q.dtype) * LARGE_NEGATIVE
             # cast to float/half then replace 1's with -inf
-            #float_mask = remove_from_windowed_attention_mask.type_as(q).masked_fill(remove_from_windowed_attention_mask, -10000.0)
             float_mask = tf.where(remove_from_windowed_attention_mask,-10000.0, tf.cast(remove_from_windowed_attention_mask, dtype=q.dtype))
             repeat_size = 1 if isinstance(self.attention_dilation, int) else len(self.attention_dilation)
             # float_mask = float_mask.repeat(1, 1, repeat_size, 1)
@@ -1040,104 +969,15 @@ class LongformerSelfAttention(tf.keras.layers.Layer): #used to be nn.module
         assert list(attn_weights.size())[:3] == [bsz, seq_len, self.num_heads]
         assert attn_weights.size(dim=3) in [self.attention_window * 2 + 1, self.attention_window * 3]
         attn_probs = self.dropout(attn_probs, training=training)
-
-
-        # # the extra attention --> FOR GLOBALL ATTENTION, NOT IMPLEMENTING
-        # if extra_attention_mask is not None:
-        #     selected_k = k.new_zeros(bsz, max_num_extra_indices_per_batch, self.num_heads, self.head_dim)
-        #     selected_k[selection_padding_mask_nonzeros] = k[extra_attention_mask_nonzeros]
-        #     # (bsz, seq_len, num_heads, max_num_extra_indices_per_batch)
-        #     # selected_attn_weights = torch.einsum('blhd,bshd->blhs', (q, selected_k))
-        #     selected_attn_weights = tf.einsum('blhd,bshd->blhs', (q, selected_k))
-        #     selected_attn_weights[selection_padding_mask_zeros[0], :, :, selection_padding_mask_zeros[1]] = -10000
-        #     # concat to attn_weights
-        #     # (bsz, seq_len, num_heads, extra attention count + 2*window+1)
-        #     # attn_weights = torch.cat((selected_attn_weights, attn_weights), dim=-1)
-        #     attn_weights = tf.concat((selected_attn_weights, attn_weights), axis=-1)
-        # # attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
-        # attn_weights_float = tf.nn.softmax(attn_weights, dim=-1, name='attn_weights_float')  # use fp32 for numerical stability
-        # if key_padding_mask is not None:
-        #     # softmax sometimes inserts NaN if all positions are masked, replace them with 0
-        #     #attn_weights_float = torch.masked_fill(attn_weights_float, key_padding_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
-        #     attn_weights_float = tf.where(attn_weights_float, key_padding_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
-        # attn_weights = attn_weights_float.type_as(attn_weights)
-        # attn_probs = F.dropout(attn_weights_float.type_as(attn_weights), p=self.dropout, training=self.training)
-        # v = v.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
-        # attn = 0
-        # if extra_attention_mask is not None:
-        #     selected_attn_probs = attn_probs.narrow(-1, 0, max_num_extra_indices_per_batch)
-        #     selected_v = v.new_zeros(bsz, max_num_extra_indices_per_batch, self.num_heads, self.head_dim)
-        #     selected_v[selection_padding_mask_nonzeros] = v[extra_attention_mask_nonzeros]
-        #     # use `matmul` because `einsum` crashes sometimes with fp16
-        #     # attn = torch.einsum('blhs,bshd->blhd', (selected_attn_probs, selected_v))
-        #     #attn = torch.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
-        #     attn = tf.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2).type_as(selected_attn_probs)).transpose(1, 2)
-        #     attn_probs = attn_probs.narrow(-1, max_num_extra_indices_per_batch, attn_probs.size(-1) - max_num_extra_indices_per_batch).contiguous()
-
-        # if self.attention_mode == 'tvm':
-        #     v = v.float().contiguous()
-        #     attn = diagonaled_mm_tvm(attn_probs, v, self.attention_window, self.attention_dilation, True, 0, False)
+       
         if self.attention_mode == "sliding_chunks":#this is the only case we will ever enter i think
             attn = sliding_chunks_matmul_pv(attn_probs, v, self.attention_window)
-        # elif self.attention_mode == "sliding_chunks_no_overlap": 
-        #     attn = sliding_chunks_no_overlap_matmul_pv(attn_probs, v, self.attention_window)
         else:
             raise False
 
         attn = attn.type_as(hidden_states)
         assert list(tf.TensorShape(attn)) == [bsz, seq_len, self.num_heads, self.head_dim]
         attn = tf.reshape(attn, (bsz, seq_len, embed_dim))
-        
-
-        # # For this case, we'll just recompute the attention for these indices
-        # # and overwrite the attn tensor. TODO: remove the redundant computation
-        # if extra_attention_mask is not None:
-        #     selected_hidden_states = hidden_states.new_zeros(max_num_extra_indices_per_batch, bsz, embed_dim)
-        #     selected_hidden_states[selection_padding_mask_nonzeros[::-1]] = hidden_states[extra_attention_mask_nonzeros[::-1]]
-
-        #     q = self.query_global(selected_hidden_states)
-        #     k = self.key_global(hidden_states)
-        #     v = self.value_global(hidden_states)
-        #     q /= math.sqrt(self.head_dim)
-
-        #     q = q.contiguous().view(max_num_extra_indices_per_batch, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (bsz*self.num_heads, max_num_extra_indices_per_batch, head_dim)
-        #     k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # bsz * self.num_heads, seq_len, head_dim)
-        #     v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # bsz * self.num_heads, seq_len, head_dim)
-        #     attn_weights = torch.bmm(q, k.transpose(1, 2))
-            
-        #     assert list(attn_weights.size()) == [bsz * self.num_heads, max_num_extra_indices_per_batch, seq_len]
-
-        #     attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, seq_len)
-        #     attn_weights[selection_padding_mask_zeros[0], :, selection_padding_mask_zeros[1], :] = -10000.0
-        #     if key_padding_mask is not None:
-        #         attn_weights = attn_weights.masked_fill(
-        #             key_padding_mask.unsqueeze(1).unsqueeze(2),
-        #             -10000.0,
-        #         )
-        #     attn_weights = attn_weights.view(bsz * self.num_heads, max_num_extra_indices_per_batch, seq_len)
-        #     attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
-        #     attn_probs = F.dropout(attn_weights_float.type_as(attn_weights), p=self.dropout, training=self.training)
-        #     selected_attn = torch.bmm(attn_probs, v)
-        #     assert list(selected_attn.size()) == [bsz * self.num_heads, max_num_extra_indices_per_batch, self.head_dim]
-
-        #     selected_attn_4d = selected_attn.view(bsz, self.num_heads, max_num_extra_indices_per_batch, self.head_dim)
-        #     nonzero_selected_attn = selected_attn_4d[selection_padding_mask_nonzeros[0], :, selection_padding_mask_nonzeros[1]]
-        #     attn[extra_attention_mask_nonzeros[::-1]] = nonzero_selected_attn.view(len(selection_padding_mask_nonzeros[0]), -1).type_as(hidden_states)
-
-        #context_layer = attn.transpose(0, 1)
-        # if output_attentions:
-        #     if extra_attention_mask is not None:
-        #         # With global attention, return global attention probabilities only
-        #         # batch_size x num_heads x max_num_global_attention_tokens x sequence_length
-        #         # which is the attention weights from tokens with global attention to all tokens
-        #         # It doesn't not return local attention
-        #         # In case of variable number of global attantion in the rows of a batch,
-        #         # attn_weights are padded with -10000.0 attention scores
-        #         attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, seq_len)
-        #     else:
-        #         # without global attention, return local attention probabilities
-        #         # batch_size x num_heads x sequence_length x window_size
-        #         # which is the attention weights of every token attending to its neighbours
-        #         attn_weights = attn_weights.permute(0, 2, 1, 3)
+       
         outputs = (attn, attn_probs) 
         return outputs
